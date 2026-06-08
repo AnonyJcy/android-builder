@@ -1,57 +1,59 @@
 # Android Builder
 
-通用 Android app 构建、测试、安装驱动脚本。支持自动检测项目配置，一键完成 build → test → install → launch 流程。
+[中文文档](README_CN.md)
 
-## 功能
+Universal Android app build, test, and install driver script. Auto-detects project configuration, supports one-click smoke testing.
 
-- 🔍 **自动检测**：包名、主 Activity、Gradle、ADB
-- 📱 **设备管理**：USB/WiFi 自动连接
-- 🚀 **一键烟雾测试**：build → test → install → launch
-- ⚙️ **交互式配置**：首次使用引导设置
+## Features
 
-## 快速开始
+- 🔍 **Auto Detection**: Package name, main Activity, Gradle, ADB
+- 📱 **Device Management**: USB/WiFi auto connection
+- 🚀 **One-Click Smoke Test**: build → test → install → launch
+- ⚙️ **Interactive Setup**: Guided first-time configuration
+
+## Quick Start
 
 ```bash
-# 1. 克隆或下载到任意位置
-git clone <repo-url> android-builder
+# 1. Clone or download
+git clone https://github.com/AnonyJcy/android-builder.git
 
-# 2. 进入你的 Android 项目目录
+# 2. Enter your Android project directory
 cd /path/to/your/android/project
 
-# 3. 初始化配置（自动检测 + 交互式填写）
+# 3. Initialize config (auto-detect + interactive)
 bash /path/to/android-builder/driver.sh init
 
-# 4. 运行烟雾测试
+# 4. Run smoke test
 bash /path/to/android-builder/driver.sh smoke
 ```
 
-## 命令列表
+## Commands
 
-| 命令 | 功能 |
-|------|------|
-| `init` | 初始化项目配置（自动检测 + 用户输入） |
-| `build` | 构建 debug APK |
-| `test` | 运行单元测试 |
-| `install` | 自动构建、检测设备、安装 APK |
-| `launch` | 在设备上启动 app |
-| `logcat` | 查看 app 日志 |
-| `clean` | 清理构建 |
-| `smoke` | 完整烟雾测试 |
-| `connect` | 检查/连接无线设备 |
-| `devices` | 列出已连接设备 |
+| Command | Description |
+|---------|-------------|
+| `init` | Initialize project config (auto-detect + user input) |
+| `build` | Build debug APK |
+| `test` | Run unit tests |
+| `install` | Auto build, detect device, install APK |
+| `launch` | Launch app on device |
+| `logcat` | View app logs |
+| `clean` | Clean build |
+| `smoke` | Full smoke test |
+| `connect` | Check/connect wireless device |
+| `devices` | List connected devices |
 
-## 自动检测
+## Auto Detection
 
-| 配置项 | 检测来源 |
-|--------|----------|
-| 包名 | `app/build.gradle` 的 `applicationId` / `namespace` |
-| 主 Activity | `AndroidManifest.xml` 的 MAIN+LAUNCHER intent-filter |
-| Gradle | 项目根目录的 `gradlew` / `gradlew.bat` |
-| ADB | 系统 PATH 或 Android SDK 目录 |
+| Config | Source |
+|--------|--------|
+| Package | `app/build.gradle` `applicationId` / `namespace` |
+| Activity | `AndroidManifest.xml` MAIN+LAUNCHER intent-filter |
+| Gradle | `gradlew` / `gradlew.bat` in project root |
+| ADB | System PATH or Android SDK directory |
 
-## 配置文件
+## Config File
 
-运行 `init` 后会在脚本同目录生成 `app-config.env`：
+Running `init` generates `app-config.env` in the script directory:
 
 ```bash
 APP_PACKAGE=com.example.myapp
@@ -62,12 +64,12 @@ WIRELESS_PORT=5555
 LOGCAT_TAGS=MainActivity
 ```
 
-## 前置条件
+## Prerequisites
 
 - JDK 17+
 - Android SDK
-- ADB（[下载](https://googledownloads.cn/android/repository/platform-tools-latest-windows.zip)）
+- ADB ([Download](https://googledownloads.cn/android/repository/platform-tools-latest-windows.zip))
 
 ## License
 
-MIT
+[MIT](LICENSE)
