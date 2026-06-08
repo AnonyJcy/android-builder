@@ -8,6 +8,7 @@
 
 - 🔍 **自动检测**：包名、主 Activity、Gradle、ADB
 - 📱 **设备管理**：USB/WiFi 自动连接
+- 🌐 **智能无线**：自动获取设备 WiFi IP，检测同局域网，获取调试端口
 - 🚀 **一键烟雾测试**：build → test → install → launch
 - ⚙️ **交互式配置**：首次使用引导设置
 

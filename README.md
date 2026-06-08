@@ -8,6 +8,7 @@ Universal Android app build, test, and install driver script. Auto-detects proje
 
 - 🔍 **Auto Detection**: Package name, main Activity, Gradle, ADB
 - 📱 **Device Management**: USB/WiFi auto connection
+- 🌐 **Smart Wireless**: Auto-detect device WiFi IP, check same LAN, get debug port
 - 🚀 **One-Click Smoke Test**: build → test → install → launch
 - ⚙️ **Interactive Setup**: Guided first-time configuration
 

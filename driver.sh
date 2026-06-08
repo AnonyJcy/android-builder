@@ -22,7 +22,6 @@ detect_package() {
   local gradle_files=(app/build.gradle app/build.gradle.kts)
   for f in "${gradle_files[@]}"; do
     if [ -f "$f" ]; then
-      # Try applicationId first, then namespace
       local pkg
       pkg=$(grep -oP 'applicationId\s*["\x27]?\K[^"\x27]+' "$f" 2>/dev/null | head -1)
       if [ -z "$pkg" ]; then
@@ -37,13 +36,12 @@ detect_package() {
   return 1
 }
 
-# Detect main activity from AndroidManifest.xml (has MAIN + LAUNCHER intent-filter)
+# Detect main activity from AndroidManifest.xml
 detect_activity() {
   local manifest="app/src/main/AndroidManifest.xml"
   if [ ! -f "$manifest" ]; then
     return 1
   fi
-  # Extract activity blocks and find the one with LAUNCHER category
   local result
   result=$(sed -n '/<activity/,/<\/activity>/p' "$manifest" | grep -B50 'LAUNCHER' | grep 'android:name' | head -1 | sed 's/.*android:name="\([^"]*\)".*/\1/')
   if [ -n "$result" ]; then
@@ -73,12 +71,82 @@ detect_adb() {
   elif [ -f "$HOME/AppData/Local/Android/Sdk/platform-tools/adb.exe" ]; then
     echo "$HOME/AppData/Local/Android/Sdk/platform-tools/adb.exe"
   else
-    # Error messages to stderr so they don't get captured by command substitution
     echo "ERROR: ADB not found." >&2
     echo "Download platform-tools from: https://googledownloads.cn/android/repository/platform-tools-latest-windows.zip" >&2
-    echo "Extract and add the folder to PATH, or place adb.exe in a directory in PATH." >&2
+    echo "Extract and add the folder to PATH." >&2
     return 1
   fi
+}
+
+# ============================================================
+# Device network detection
+# ============================================================
+
+# Get device WiFi IP address
+get_device_wifi_ip() {
+  $ADB shell ip addr show wlan0 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1
+}
+
+# Get device WiFi MAC address
+get_device_wifi_mac() {
+  $ADB shell ip addr show wlan0 2>/dev/null | grep -oP 'link/ether \K[0-9a-f:]+' | head -1
+}
+
+# Get device wireless debugging port
+get_device_adb_port() {
+  # Try to get port from system properties
+  local port
+  port=$($ADB shell getprop service.adb.tcp.port 2>/dev/null | tr -d '\r\n')
+  if [ -n "$port" ] && [ "$port" != "0" ]; then
+    echo "$port"
+    return 0
+  fi
+  port=$($ADB shell getprop persist.adb.tcp.port 2>/dev/null | tr -d '\r\n')
+  if [ -n "$port" ] && [ "$port" != "0" ]; then
+    echo "$port"
+    return 0
+  fi
+  return 1
+}
+
+# Get computer's local IP in the same network segment
+get_computer_ip() {
+  # Try to get the IP that matches the device's subnet
+  local device_ip="$1"
+  if [ -z "$device_ip" ]; then
+    # Just return any non-loopback IP
+    ip addr show 2>/dev/null | grep -oP 'inet \K[0-9.]+' | grep -v '^127\.' | head -1 || \
+    hostname -I 2>/dev/null | awk '{print $1}' || \
+    return 1
+  else
+    # Get subnet from device IP (first 3 octets)
+    local subnet
+    subnet=$(echo "$device_ip" | cut -d'.' -f1-3)
+    # Find matching IP on computer
+    ip addr show 2>/dev/null | grep -oP 'inet \K[0-9.]+' | grep "^${subnet}\." | head -1 || \
+    return 1
+  fi
+}
+
+# Check if device and computer are on the same LAN
+check_same_lan() {
+  local device_ip="$1"
+  local computer_ip="$2"
+
+  if [ -z "$device_ip" ] || [ -z "$computer_ip" ]; then
+    return 1
+  fi
+
+  # Compare first 3 octets (subnet)
+  local device_subnet
+  device_subnet=$(echo "$device_ip" | cut -d'.' -f1-3)
+  local computer_subnet
+  computer_subnet=$(echo "$computer_ip" | cut -d'.' -f1-3)
+
+  if [ "$device_subnet" = "$computer_subnet" ]; then
+    return 0
+  fi
+  return 1
 }
 
 # ============================================================
@@ -93,7 +161,6 @@ load_config() {
   fi
   source "$CONFIG_FILE"
 
-  # Validate required fields
   if [ -z "${APP_PACKAGE:-}" ]; then
     echo "ERROR: APP_PACKAGE not set in config. Run: bash driver.sh init"
     exit 1
@@ -103,7 +170,6 @@ load_config() {
     exit 1
   fi
 
-  # Set defaults
   APK_PATH="${APK_PATH:-app/build/outputs/apk/debug/app-debug.apk}"
   WIRELESS_PORT="${WIRELESS_PORT:-5555}"
   LOGCAT_TAGS="${LOGCAT_TAGS:-$APP_PACKAGE}"
@@ -202,11 +268,10 @@ cmd_init() {
   echo "=== Android Builder: Initialize Configuration ==="
   echo ""
 
-  # --- Auto-detect ---
-  echo "[1/3] Auto-detecting project configuration..."
+  # --- Auto-detect project config ---
+  echo "[1/4] Auto-detecting project configuration..."
   echo ""
 
-  # Package
   local detected_pkg
   detected_pkg=$(detect_package 2>/dev/null || true)
   if [ -n "$detected_pkg" ]; then
@@ -215,7 +280,6 @@ cmd_init() {
     echo "  ✗ Package: not detected"
   fi
 
-  # Activity
   local detected_act
   detected_act=$(detect_activity 2>/dev/null || true)
   if [ -n "$detected_act" ]; then
@@ -224,7 +288,6 @@ cmd_init() {
     echo "  ✗ Activity: not detected"
   fi
 
-  # Gradle
   local detected_gradle
   detected_gradle=$(detect_gradle 2>/dev/null || true)
   if [ -n "$detected_gradle" ]; then
@@ -233,7 +296,6 @@ cmd_init() {
     echo "  ✗ Gradle: not detected"
   fi
 
-  # ADB
   local detected_adb
   detected_adb=$(detect_adb 2>/dev/null || true)
   if [ -n "$detected_adb" ]; then
@@ -244,8 +306,68 @@ cmd_init() {
 
   echo ""
 
-  # --- User input for missing values ---
-  echo "[2/3] Confirm or fill in configuration..."
+  # --- Detect device network info ---
+  echo "[2/4] Detecting device network information..."
+  echo ""
+
+  local device_wifi_ip=""
+  local device_wifi_mac=""
+  local computer_ip=""
+  local same_lan=false
+  local adb_port=""
+
+  if [ -n "$detected_adb" ]; then
+    ADB="$detected_adb"
+
+    # Check for wired device
+    if check_wired_device; then
+      echo "  ✓ USB device connected"
+
+      # Get device WiFi info
+      device_wifi_ip=$(get_device_wifi_ip 2>/dev/null || true)
+      device_wifi_mac=$(get_device_wifi_mac 2>/dev/null || true)
+
+      if [ -n "$device_wifi_ip" ]; then
+        echo "  ✓ Device WiFi IP: $device_wifi_ip"
+        if [ -n "$device_wifi_mac" ]; then
+          echo "  ✓ Device WiFi MAC: $device_wifi_mac"
+        fi
+
+        # Check if on same LAN
+        computer_ip=$(get_computer_ip "$device_wifi_ip" 2>/dev/null || true)
+        if [ -n "$computer_ip" ]; then
+          echo "  ✓ Computer IP: $computer_ip"
+          if check_same_lan "$device_wifi_ip" "$computer_ip"; then
+            echo "  ✓ Same LAN detected"
+            same_lan=true
+
+            # Try to get wireless debug port
+            adb_port=$(get_device_adb_port 2>/dev/null || true)
+            if [ -n "$adb_port" ]; then
+              echo "  ✓ Wireless debug port: $adb_port"
+            else
+              echo "  ✗ Wireless debug port: not detected (enable in Developer options)"
+            fi
+          else
+            echo "  ✗ Different LAN - wireless connection not available"
+          fi
+        else
+          echo "  ✗ Computer IP: not detected"
+        fi
+      else
+        echo "  ✗ Device WiFi: not connected"
+      fi
+    else
+      echo "  ✗ No USB device connected"
+    fi
+  else
+    echo "  ✗ ADB not available"
+  fi
+
+  echo ""
+
+  # --- User input for project config ---
+  echo "[3/4] Confirm or fill in project configuration..."
   echo ""
 
   # Package
@@ -277,13 +399,34 @@ cmd_init() {
   read -p "  APK output path [$default_apk]: " input_apk
   APK_PATH="${input_apk:-$default_apk}"
 
-  # Wireless device (optional)
+  # Wireless device config
   echo ""
-  echo "  Wireless device (optional, press Enter to skip):"
-  read -p "  IP address: " WIRELESS_IP
-  if [ -n "$WIRELESS_IP" ]; then
-    read -p "  Port [5555]: " input_port
-    WIRELESS_PORT="${input_port:-5555}"
+  echo "  Wireless device configuration:"
+
+  if $same_lan && [ -n "$device_wifi_ip" ]; then
+    echo "  (Device detected on same LAN: $device_wifi_ip)"
+    read -p "  Use this IP for wireless connection? (Y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+      WIRELESS_IP="$device_wifi_ip"
+    else
+      read -p "  IP address: " WIRELESS_IP
+    fi
+  else
+    read -p "  IP address (press Enter to skip): " WIRELESS_IP
+  fi
+
+  if [ -n "${WIRELESS_IP:-}" ]; then
+    if [ -n "$adb_port" ]; then
+      read -p "  Port [$adb_port]: " input_port
+      WIRELESS_PORT="${input_port:-$adb_port}"
+    else
+      read -p "  Port (check on device: Developer options > Wireless debugging): " WIRELESS_PORT
+      if [ -z "$WIRELESS_PORT" ]; then
+        echo "  WARNING: Port is required for wireless connection"
+        WIRELESS_PORT="5555"
+      fi
+    fi
   else
     WIRELESS_PORT="5555"
   fi
@@ -294,7 +437,7 @@ cmd_init() {
 
   # --- Confirm ---
   echo ""
-  echo "[3/3] Configuration summary:"
+  echo "[4/4] Configuration summary:"
   echo ""
   echo "  Package:    $APP_PACKAGE"
   echo "  Activity:   $APP_ACTIVITY"
@@ -385,7 +528,6 @@ cmd_logcat() {
     fi
   fi
 
-  # Build logcat filter from LOGCAT_TAGS
   local filter
   filter=$(echo "$LOGCAT_TAGS" | tr ',' ' ')
 
@@ -448,12 +590,46 @@ cmd_smoke() {
 
 cmd_connect() {
   echo "=== Device Connection Status ==="
+
+  # Check wired
   if check_wired_device; then
     echo "✓ Wired device connected"
+
+    # Auto-detect WiFi info for wireless setup
+    echo ""
+    echo "Device network info:"
+    local wifi_ip
+    wifi_ip=$(get_device_wifi_ip 2>/dev/null || true)
+    local wifi_mac
+    wifi_mac=$(get_device_wifi_mac 2>/dev/null || true)
+
+    if [ -n "$wifi_ip" ]; then
+      echo "  WiFi IP:  $wifi_ip"
+      echo "  WiFi MAC: ${wifi_mac:-unknown}"
+
+      # Check same LAN
+      local comp_ip
+      comp_ip=$(get_computer_ip "$wifi_ip" 2>/dev/null || true)
+      if [ -n "$comp_ip" ]; then
+        echo "  Computer: $comp_ip"
+        if check_same_lan "$wifi_ip" "$comp_ip"; then
+          echo "  LAN:      ✓ Same network"
+          echo ""
+          echo "  Wireless connection available: adb connect $wifi_ip:<port>"
+        else
+          echo "  LAN:      ✗ Different network"
+        fi
+      fi
+    else
+      echo "  WiFi:     Not connected"
+    fi
   else
     echo "✗ No wired device"
   fi
 
+  echo ""
+
+  # Check wireless
   if check_wireless_device; then
     echo "✓ Wireless device connected ($WIRELESS_IP:$WIRELESS_PORT)"
   elif [ -n "${WIRELESS_IP:-}" ]; then
@@ -472,6 +648,19 @@ cmd_connect() {
 cmd_devices() {
   echo "=== Connected devices ==="
   $ADB devices -l 2>&1
+  echo ""
+
+  # Show network info if wired device connected
+  if check_wired_device; then
+    echo "=== Device Network ==="
+    local wifi_ip
+    wifi_ip=$(get_device_wifi_ip 2>/dev/null || true)
+    local wifi_mac
+    wifi_mac=$(get_device_wifi_mac 2>/dev/null || true)
+    echo "WiFi IP:  ${wifi_ip:-not connected}"
+    echo "WiFi MAC: ${wifi_mac:-unknown}"
+  fi
+
   echo ""
   echo "ADB path: $ADB"
 }
@@ -523,7 +712,6 @@ fi
 # Detect ADB (for commands that need it)
 case "$CMD" in
   build|test|clean)
-    # These don't need ADB
     ;;
   *)
     ADB=$(detect_adb 2>/dev/null || true)
