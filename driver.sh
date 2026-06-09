@@ -1,23 +1,58 @@
 #!/usr/bin/env bash
 # Android App Builder Driver
-# Usage: bash driver.sh <command>
-# Commands: init | build | test | install | launch | logcat | clean | smoke | connect | devices
+# Usage: bash driver.sh <command> [options]
+# Commands: init | build | test | install | launch | logcat | clean | smoke | connect | devices | doctor | screenshot | ui-dump | inspect
 
 set -euo pipefail
-# Resolve script directory (for config file)
+
+# ============================================================
+# Global setup
+# ============================================================
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# Project root is the current working directory (where the Android project is)
 PROJECT_ROOT="$(pwd)"
 cd "$PROJECT_ROOT"
 
 CONFIG_FILE="$SCRIPT_DIR/app-config.env"
 CMD="${1:-help}"
+shift 2>/dev/null || true
+ARGS=("$@")
+
+# Parse global flags
+JSON_MODE=false
+for arg in "${ARGS[@]}"; do
+  if [ "$arg" = "--json" ]; then
+    JSON_MODE=true
+  fi
+done
+
+# ============================================================
+# Logging functions
+# ============================================================
+
+log_info()  { echo "[INFO] $*"; }
+log_warn()  { echo "[WARN] $*"; }
+log_error() { echo "[ERROR] $*"; }
+log_ok()    { echo "[OK] $*"; }
+
+# ============================================================
+# JSON helpers (no jq dependency)
+# ============================================================
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  echo -n "$s"
+}
 
 # ============================================================
 # Auto-detection functions
 # ============================================================
 
-# Detect applicationId / namespace from build.gradle*
 detect_package() {
   local gradle_files=(app/build.gradle app/build.gradle.kts)
   for f in "${gradle_files[@]}"; do
@@ -36,7 +71,6 @@ detect_package() {
   return 1
 }
 
-# Detect main activity from AndroidManifest.xml
 detect_activity() {
   local manifest="app/src/main/AndroidManifest.xml"
   if [ ! -f "$manifest" ]; then
@@ -51,7 +85,6 @@ detect_activity() {
   return 1
 }
 
-# Detect Gradle wrapper
 detect_gradle() {
   if [ -f "./gradlew" ]; then
     echo "./gradlew"
@@ -62,7 +95,6 @@ detect_gradle() {
   fi
 }
 
-# Detect ADB
 detect_adb() {
   if command -v adb &>/dev/null; then
     echo "adb"
@@ -71,9 +103,7 @@ detect_adb() {
   elif [ -f "$HOME/AppData/Local/Android/Sdk/platform-tools/adb.exe" ]; then
     echo "$HOME/AppData/Local/Android/Sdk/platform-tools/adb.exe"
   else
-    echo "ERROR: ADB not found." >&2
-    echo "Download platform-tools from: https://googledownloads.cn/android/repository/platform-tools-latest-windows.zip" >&2
-    echo "Extract and add the folder to PATH." >&2
+    log_error "ADB not found. Download: https://googledownloads.cn/android/repository/platform-tools-latest-windows.zip" >&2
     return 1
   fi
 }
@@ -82,19 +112,15 @@ detect_adb() {
 # Device network detection
 # ============================================================
 
-# Get device WiFi IP address
 get_device_wifi_ip() {
   $ADB shell ip addr show wlan0 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1
 }
 
-# Get device WiFi MAC address
 get_device_wifi_mac() {
   $ADB shell ip addr show wlan0 2>/dev/null | grep -oP 'link/ether \K[0-9a-f:]+' | head -1
 }
 
-# Get device wireless debugging port
 get_device_adb_port() {
-  # Try to get port from system properties
   local port
   port=$($ADB shell getprop service.adb.tcp.port 2>/dev/null | tr -d '\r\n')
   if [ -n "$port" ] && [ "$port" != "0" ]; then
@@ -109,44 +135,31 @@ get_device_adb_port() {
   return 1
 }
 
-# Get computer's local IP in the same network segment
 get_computer_ip() {
-  # Try to get the IP that matches the device's subnet
   local device_ip="$1"
   if [ -z "$device_ip" ]; then
-    # Just return any non-loopback IP
     ip addr show 2>/dev/null | grep -oP 'inet \K[0-9.]+' | grep -v '^127\.' | head -1 || \
     hostname -I 2>/dev/null | awk '{print $1}' || \
     return 1
   else
-    # Get subnet from device IP (first 3 octets)
     local subnet
     subnet=$(echo "$device_ip" | cut -d'.' -f1-3)
-    # Find matching IP on computer
     ip addr show 2>/dev/null | grep -oP 'inet \K[0-9.]+' | grep "^${subnet}\." | head -1 || \
     return 1
   fi
 }
 
-# Check if device and computer are on the same LAN
 check_same_lan() {
   local device_ip="$1"
   local computer_ip="$2"
-
   if [ -z "$device_ip" ] || [ -z "$computer_ip" ]; then
     return 1
   fi
-
-  # Compare first 3 octets (subnet)
   local device_subnet
   device_subnet=$(echo "$device_ip" | cut -d'.' -f1-3)
   local computer_subnet
   computer_subnet=$(echo "$computer_ip" | cut -d'.' -f1-3)
-
-  if [ "$device_subnet" = "$computer_subnet" ]; then
-    return 0
-  fi
-  return 1
+  [ "$device_subnet" = "$computer_subnet" ]
 }
 
 # ============================================================
@@ -155,18 +168,17 @@ check_same_lan() {
 
 load_config() {
   if [ ! -f "$CONFIG_FILE" ]; then
-    echo "ERROR: Configuration not found."
-    echo "Run: bash driver.sh init"
+    log_error "Configuration not found. Run: bash driver.sh init"
     exit 1
   fi
   source "$CONFIG_FILE"
 
   if [ -z "${APP_PACKAGE:-}" ]; then
-    echo "ERROR: APP_PACKAGE not set in config. Run: bash driver.sh init"
+    log_error "APP_PACKAGE not set. Run: bash driver.sh init"
     exit 1
   fi
   if [ -z "${APP_ACTIVITY:-}" ]; then
-    echo "ERROR: APP_ACTIVITY not set in config. Run: bash driver.sh init"
+    log_error "APP_ACTIVITY not set. Run: bash driver.sh init"
     exit 1
   fi
 
@@ -194,57 +206,48 @@ WIRELESS_PORT=${WIRELESS_PORT:-5555}
 # Logcat
 LOGCAT_TAGS=$LOGCAT_TAGS
 EOF
-  echo "✓ Configuration saved to: $CONFIG_FILE"
+  log_ok "Configuration saved to: $CONFIG_FILE"
 }
 
 # ============================================================
-# ADB device functions
+# Device connection
 # ============================================================
 
 check_wired_device() {
   local devices
   devices=$($ADB devices 2>/dev/null | grep -v "List" | grep -v "^$" | grep -v "wireless" || true)
-  if echo "$devices" | grep -q "device$"; then
-    return 0
-  fi
-  return 1
+  echo "$devices" | grep -q "device$"
 }
 
 check_wireless_device() {
   if [ -z "${WIRELESS_IP:-}" ]; then
     return 1
   fi
-  if $ADB devices 2>/dev/null | grep -q "$WIRELESS_IP:$WIRELESS_PORT"; then
-    return 0
-  fi
-  return 1
+  $ADB devices 2>/dev/null | grep -q "$WIRELESS_IP:$WIRELESS_PORT"
 }
 
 connect_wireless() {
   if [ -z "${WIRELESS_IP:-}" ]; then
-    echo "No wireless device configured. Run: bash driver.sh init"
+    log_error "No wireless device configured. Run: bash driver.sh init"
     return 1
   fi
 
-  echo "=== Connecting to wireless device ==="
-  echo "Target: $WIRELESS_IP:$WIRELESS_PORT"
+  log_info "Connecting to wireless device: $WIRELESS_IP:$WIRELESS_PORT"
 
   if check_wireless_device; then
-    echo "Already connected to $WIRELESS_IP:$WIRELESS_PORT"
+    log_ok "Already connected to $WIRELESS_IP:$WIRELESS_PORT"
     return 0
   fi
 
-  echo "Attempting wireless connection..."
   if $ADB connect "$WIRELESS_IP:$WIRELESS_PORT" 2>&1 | grep -q "connected"; then
-    echo "Successfully connected to $WIRELESS_IP:$WIRELESS_PORT"
+    log_ok "Connected to $WIRELESS_IP:$WIRELESS_PORT"
     return 0
   else
-    echo "Failed to connect to $WIRELESS_IP:$WIRELESS_PORT"
-    echo ""
-    echo "Troubleshooting:"
-    echo "1. Ensure device and computer are on the same network"
-    echo "2. Enable wireless debugging on device (Developer options > Wireless debugging)"
-    echo "3. Pair device first: adb pair $WIRELESS_IP:<pairing_port>"
+    log_error "Failed to connect to $WIRELESS_IP:$WIRELESS_PORT"
+    log_info "Troubleshooting:"
+    log_info "  1. Ensure device and computer are on the same network"
+    log_info "  2. Enable wireless debugging (Developer options)"
+    log_info "  3. Pair first: adb pair $WIRELESS_IP:<pairing_port>"
     return 1
   fi
 }
@@ -260,8 +263,461 @@ get_active_device() {
   return 1
 }
 
+ensure_device_connected() {
+  local device_type
+  device_type=$(get_active_device 2>/dev/null || true)
+  if [ -z "$device_type" ]; then
+    log_warn "No device found. Attempting wireless connection..."
+    if ! connect_wireless; then
+      log_error "No device available"
+      return 1
+    fi
+  fi
+  return 0
+}
+
 # ============================================================
-# Init command
+# Device info helpers
+# ============================================================
+
+get_current_activity() {
+  # Get the current foreground activity
+  $ADB shell dumpsys activity activities 2>/dev/null | \
+    grep -oP 'mResumedActivity.*\{[^}]*\K[a-zA-Z0-9.]+/[a-zA-Z0-9.]+' | head -1 || \
+  $ADB shell dumpsys window 2>/dev/null | \
+    grep -oP 'mCurrentFocus.*\{[^}]*\K[a-zA-Z0-9.]+/[a-zA-Z0-9.]+' | head -1
+}
+
+wait_for_activity() {
+  local target_activity="$1"
+  local timeout="${2:-15}"
+  local elapsed=0
+
+  log_info "Waiting for activity: $target_activity (timeout: ${timeout}s)"
+
+  while [ $elapsed -lt $timeout ]; do
+    local current
+    current=$(get_current_activity 2>/dev/null || true)
+    if [ -n "$current" ]; then
+      echo "$current"
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  log_warn "Activity detection timeout after ${timeout}s"
+  return 1
+}
+
+# ============================================================
+# Crash analysis
+# ============================================================
+
+find_latest_crash() {
+  # Extract the latest crash from logcat
+  local logcat_output
+  logcat_output=$($ADB logcat -d -t 500 2>/dev/null || true)
+
+  if [ -z "$logcat_output" ]; then
+    return 1
+  fi
+
+  # Find FATAL EXCEPTION or AndroidRuntime crash
+  local crash_block
+  crash_block=$(echo "$logcat_output" | awk '
+    /FATAL EXCEPTION|AndroidRuntime|Process:.*has died/ { found=1; block="" }
+    found { block = block "\n" $0 }
+    found && /^[[:space:]]*$/ { found=0; print block; block="" }
+    END { if (found) print block }
+  ' | tail -1)
+
+  if [ -z "$crash_block" ]; then
+    # Check for native crashes
+    crash_block=$(echo "$logcat_output" | awk '
+      /signal 11|signal 6|native crash|DEBUG.*pid/ { found=1; block="" }
+      found { block = block "\n" $0 }
+      found && /^[[:space:]]*$/ { found=0; print block; block="" }
+      END { if (found) print block }
+    ' | tail -1)
+  fi
+
+  if [ -n "$crash_block" ]; then
+    echo "$crash_block"
+    return 0
+  fi
+  return 1
+}
+
+analyze_crash() {
+  local crash_data="$1"
+
+  # Extract crash type
+  local crash_type=""
+  crash_type=$(echo "$crash_data" | grep -oP 'FATAL EXCEPTION.*' | head -1 || true)
+  if [ -z "$crash_type" ]; then
+    crash_type=$(echo "$crash_data" | grep -oP 'signal \d+' | head -1 || true)
+  fi
+
+  # Extract exception name
+  local exception=""
+  exception=$(echo "$crash_data" | grep -oP '[a-zA-Z]+Exception|[a-zA-Z]+Error' | head -1 || true)
+
+  # Extract location
+  local location=""
+  location=$(echo "$crash_data" | grep -oP '\(.*\.java:\d+\)|\(.*\.kt:\d+\)' | head -1 || true)
+  if [ -z "$location" ]; then
+    location=$(echo "$crash_data" | grep -oP '[a-zA-Z]+\.(java|kt):\d+' | head -1 || true)
+  fi
+
+  # Extract process name
+  local process=""
+  process=$(echo "$crash_data" | grep -oP 'Process:\s*\K\S+' | head -1 || true)
+
+  echo "type=$(json_escape "${crash_type:-unknown}")"
+  echo "exception=$(json_escape "${exception:-unknown}")"
+  echo "location=$(json_escape "${location:-unknown}")"
+  echo "process=$(json_escape "${process:-unknown}")"
+}
+
+check_runtime_crash() {
+  local package="$1"
+  local logcat_output
+  logcat_output=$($ADB logcat -d -t 200 2>/dev/null || true)
+
+  # Check for crashes related to our package
+  if echo "$logcat_output" | grep -q "FATAL EXCEPTION" && \
+     echo "$logcat_output" | grep -q "$package"; then
+    return 0
+  fi
+  return 1
+}
+
+# ============================================================
+# cmd_doctor
+# ============================================================
+
+cmd_doctor() {
+  local results=()
+
+  echo "=== Android Builder Doctor ==="
+  echo ""
+
+  # --- Environment checks ---
+  log_info "Checking environment..."
+  echo ""
+
+  # Java
+  if command -v java &>/dev/null; then
+    local java_version
+    java_version=$(java -version 2>&1 | head -1 | grep -oP '"\K[^"]+' || echo "unknown")
+    log_ok "Java detected: $java_version"
+    results+=("java=true")
+  else
+    log_error "Java not found"
+    results+=("java=false")
+  fi
+
+  # javac
+  if command -v javac &>/dev/null; then
+    log_ok "javac detected"
+    results+=("javac=true")
+  else
+    log_warn "javac not found (needed for some builds)"
+    results+=("javac=false")
+  fi
+
+  # ADB
+  local detected_adb
+  detected_adb=$(detect_adb 2>/dev/null || true)
+  if [ -n "$detected_adb" ]; then
+    log_ok "ADB detected: $detected_adb"
+    results+=("adb=true")
+    ADB="$detected_adb"
+  else
+    log_error "ADB not found"
+    results+=("adb=false")
+  fi
+
+  # Gradle
+  local detected_gradle
+  detected_gradle=$(detect_gradle 2>/dev/null || true)
+  if [ -n "$detected_gradle" ]; then
+    log_ok "Gradle detected: $detected_gradle"
+    results+=("gradle=true")
+  else
+    log_warn "Gradle wrapper not found"
+    results+=("gradle=false")
+  fi
+
+  # ANDROID_HOME / ANDROID_SDK_ROOT
+  if [ -n "${ANDROID_HOME:-}" ]; then
+    log_ok "ANDROID_HOME: $ANDROID_HOME"
+    results+=("android_home=true")
+  elif [ -n "${ANDROID_SDK_ROOT:-}" ]; then
+    log_ok "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
+    results+=("android_home=true")
+  else
+    log_warn "ANDROID_HOME / ANDROID_SDK_ROOT not set"
+    results+=("android_home=false")
+  fi
+
+  # Device connection
+  echo ""
+  log_info "Checking device connection..."
+  echo ""
+
+  if [ -n "${ADB:-}" ]; then
+    if check_wired_device; then
+      log_ok "Wired device connected"
+      results+=("device_connected=true")
+      results+=("device_type=wired")
+
+      # Get device info
+      local wifi_ip
+      wifi_ip=$(get_device_wifi_ip 2>/dev/null || true)
+      local wifi_mac
+      wifi_mac=$(get_device_wifi_mac 2>/dev/null || true)
+      if [ -n "$wifi_ip" ]; then
+        log_ok "Device WiFi IP: $wifi_ip"
+        results+=("wifi_ip=$wifi_ip")
+      fi
+      if [ -n "$wifi_mac" ]; then
+        log_ok "Device WiFi MAC: $wifi_mac"
+        results+=("wifi_mac=$wifi_mac")
+      fi
+
+      # Check wireless debug support
+      local adb_port
+      adb_port=$(get_device_adb_port 2>/dev/null || true)
+      if [ -n "$adb_port" ]; then
+        log_ok "Wireless debug port: $adb_port"
+        results+=("wireless_adb=true")
+        results+=("adb_port=$adb_port")
+      else
+        log_info "Wireless debug: port not detected"
+        results+=("wireless_adb=false")
+      fi
+    elif check_wireless_device; then
+      log_ok "Wireless device connected ($WIRELESS_IP:$WIRELESS_PORT)"
+      results+=("device_connected=true")
+      results+=("device_type=wireless")
+    else
+      log_error "No connected device"
+      results+=("device_connected=false")
+    fi
+  else
+    log_error "ADB not available, skipping device checks"
+    results+=("device_connected=false")
+  fi
+
+  # --- Crash analysis ---
+  echo ""
+  log_info "Checking for recent crashes..."
+  echo ""
+
+  if [ -n "${ADB:-}" ] && check_wired_device || check_wireless_device 2>/dev/null; then
+    local crash_data
+    crash_data=$(find_latest_crash 2>/dev/null || true)
+    if [ -n "$crash_data" ]; then
+      log_error "Crash detected!"
+      echo ""
+      echo "[Crash Detected]"
+
+      local crash_info
+      crash_info=$(analyze_crash "$crash_data")
+
+      local crash_type
+      crash_type=$(echo "$crash_info" | grep '^type=' | cut -d= -f2-)
+      local exception
+      exception=$(echo "$crash_info" | grep '^exception=' | cut -d= -f2-)
+      local location
+      location=$(echo "$crash_info" | grep '^location=' | cut -d= -f2-)
+
+      echo "Type: ${crash_type:-unknown}"
+      echo "Exception: ${exception:-unknown}"
+      echo "Location: ${location:-unknown}"
+
+      results+=("has_crash=true")
+      results+=("crash_type=$(json_escape "$crash_type")")
+      results+=("crash_exception=$(json_escape "$exception")")
+      results+=("crash_location=$(json_escape "$location")")
+    else
+      log_ok "No recent crashes found"
+      results+=("has_crash=false")
+    fi
+  else
+    log_warn "No device connected, skipping crash check"
+    results+=("has_crash=unknown")
+  fi
+
+  # --- JSON output ---
+  if $JSON_MODE; then
+    echo ""
+    print_json_doctor "${results[@]}"
+  fi
+
+  echo ""
+  log_info "Doctor check complete."
+}
+
+print_json_doctor() {
+  local results=("$@")
+  local json="{"
+
+  local first=true
+  for item in "${results[@]}"; do
+    local key="${item%%=*}"
+    local value="${item#*=}"
+
+    if $first; then
+      first=false
+    else
+      json+=","
+    fi
+
+    # Convert "true"/"false" strings to JSON booleans
+    if [ "$value" = "true" ]; then
+      json+="\"$key\":true"
+    elif [ "$value" = "false" ]; then
+      json+="\"$key\":false"
+    else
+      json+="\"$key\":\"$(json_escape "$value")\""
+    fi
+  done
+
+  json+="}"
+  echo "$json"
+}
+
+# ============================================================
+# cmd_screenshot
+# ============================================================
+
+cmd_screenshot() {
+  local custom_name="${1:-}"
+  local output_dir="./screenshots"
+
+  ensure_device_connected || exit 1
+
+  mkdir -p "$output_dir"
+
+  # Generate filename
+  local filename
+  if [ -n "$custom_name" ]; then
+    filename="${custom_name}.png"
+  else
+    filename="screenshot_$(date +%Y%m%d_%H%M%S).png"
+  fi
+  local output_path="$output_dir/$filename"
+  local tmp_file="/sdcard/__android_builder_tmp.png"
+
+  log_info "Taking screenshot..."
+
+  # Capture on device
+  if ! $ADB shell screencap -p "$tmp_file" 2>/dev/null; then
+    log_error "Failed to capture screenshot on device"
+    return 1
+  fi
+
+  # Pull to local
+  if ! $ADB pull "$tmp_file" "$output_path" 2>/dev/null; then
+    log_error "Failed to pull screenshot"
+    $ADB shell rm -f "$tmp_file" 2>/dev/null
+    return 1
+  fi
+
+  # Cleanup temp file on device
+  $ADB shell rm -f "$tmp_file" 2>/dev/null
+
+  if [ -f "$output_path" ]; then
+    log_ok "Screenshot saved:"
+    log_info "$output_path"
+    echo "$output_path"
+  else
+    log_error "Screenshot file not created"
+    return 1
+  fi
+}
+
+# ============================================================
+# cmd_ui_dump
+# ============================================================
+
+cmd_ui_dump() {
+  local output_dir="./ui-dumps"
+
+  ensure_device_connected || exit 1
+
+  mkdir -p "$output_dir"
+
+  local filename="ui_$(date +%Y%m%d_%H%M%S).xml"
+  local output_path="$output_dir/$filename"
+  local tmp_file="/sdcard/window_dump.xml"
+
+  log_info "Dumping UI hierarchy..."
+
+  # Dump UI on device
+  if ! $ADB shell uiautomator dump "$tmp_file" 2>/dev/null; then
+    log_error "Failed to dump UI hierarchy"
+    return 1
+  fi
+
+  # Pull to local
+  if ! $ADB pull "$tmp_file" "$output_path" 2>/dev/null; then
+    log_error "Failed to pull UI dump"
+    return 1
+  fi
+
+  # Cleanup
+  $ADB shell rm -f "$tmp_file" 2>/dev/null
+
+  if [ -f "$output_path" ]; then
+    log_ok "UI dumped:"
+    log_info "$output_path"
+    echo "$output_path"
+  else
+    log_error "UI dump file not created"
+    return 1
+  fi
+}
+
+# ============================================================
+# cmd_inspect (screenshot + ui-dump)
+# ============================================================
+
+cmd_inspect() {
+  echo "=== Inspecting current screen ==="
+  echo ""
+
+  ensure_device_connected || exit 1
+
+  # Screenshot
+  log_info "[1/2] Taking screenshot..."
+  local screenshot_path
+  screenshot_path=$(cmd_screenshot "inspect_$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true)
+
+  # UI dump
+  log_info "[2/2] Dumping UI hierarchy..."
+  local ui_dump_path
+  ui_dump_path=$(cmd_ui_dump 2>/dev/null || true)
+
+  echo ""
+  echo "=== Inspection Results ==="
+  if [ -n "$screenshot_path" ]; then
+    log_ok "Screenshot: $screenshot_path"
+  else
+    log_error "Screenshot failed"
+  fi
+  if [ -n "$ui_dump_path" ]; then
+    log_ok "UI dump: $ui_dump_path"
+  else
+    log_error "UI dump failed"
+  fi
+}
+
+# ============================================================
+# cmd_init
 # ============================================================
 
 cmd_init() {
@@ -269,45 +725,45 @@ cmd_init() {
   echo ""
 
   # --- Auto-detect project config ---
-  echo "[1/4] Auto-detecting project configuration..."
+  log_info "[1/4] Auto-detecting project configuration..."
   echo ""
 
   local detected_pkg
   detected_pkg=$(detect_package 2>/dev/null || true)
   if [ -n "$detected_pkg" ]; then
-    echo "  ✓ Package: $detected_pkg"
+    log_ok "Package: $detected_pkg"
   else
-    echo "  ✗ Package: not detected"
+    log_warn "Package: not detected"
   fi
 
   local detected_act
   detected_act=$(detect_activity 2>/dev/null || true)
   if [ -n "$detected_act" ]; then
-    echo "  ✓ Activity: $detected_act"
+    log_ok "Activity: $detected_act"
   else
-    echo "  ✗ Activity: not detected"
+    log_warn "Activity: not detected"
   fi
 
   local detected_gradle
   detected_gradle=$(detect_gradle 2>/dev/null || true)
   if [ -n "$detected_gradle" ]; then
-    echo "  ✓ Gradle: $detected_gradle"
+    log_ok "Gradle: $detected_gradle"
   else
-    echo "  ✗ Gradle: not detected"
+    log_warn "Gradle: not detected"
   fi
 
   local detected_adb
   detected_adb=$(detect_adb 2>/dev/null || true)
   if [ -n "$detected_adb" ]; then
-    echo "  ✓ ADB: $detected_adb"
+    log_ok "ADB: $detected_adb"
   else
-    echo "  ✗ ADB: not detected"
+    log_warn "ADB: not detected"
   fi
 
   echo ""
 
   # --- Detect device network info ---
-  echo "[2/4] Detecting device network information..."
+  log_info "[2/4] Detecting device network information..."
   echo ""
 
   local device_wifi_ip=""
@@ -319,55 +775,51 @@ cmd_init() {
   if [ -n "$detected_adb" ]; then
     ADB="$detected_adb"
 
-    # Check for wired device
     if check_wired_device; then
-      echo "  ✓ USB device connected"
+      log_ok "USB device connected"
 
-      # Get device WiFi info
       device_wifi_ip=$(get_device_wifi_ip 2>/dev/null || true)
       device_wifi_mac=$(get_device_wifi_mac 2>/dev/null || true)
 
       if [ -n "$device_wifi_ip" ]; then
-        echo "  ✓ Device WiFi IP: $device_wifi_ip"
+        log_ok "Device WiFi IP: $device_wifi_ip"
         if [ -n "$device_wifi_mac" ]; then
-          echo "  ✓ Device WiFi MAC: $device_wifi_mac"
+          log_ok "Device WiFi MAC: $device_wifi_mac"
         fi
 
-        # Check if on same LAN
         computer_ip=$(get_computer_ip "$device_wifi_ip" 2>/dev/null || true)
         if [ -n "$computer_ip" ]; then
-          echo "  ✓ Computer IP: $computer_ip"
+          log_ok "Computer IP: $computer_ip"
           if check_same_lan "$device_wifi_ip" "$computer_ip"; then
-            echo "  ✓ Same LAN detected"
+            log_ok "Same LAN detected"
             same_lan=true
 
-            # Try to get wireless debug port
             adb_port=$(get_device_adb_port 2>/dev/null || true)
             if [ -n "$adb_port" ]; then
-              echo "  ✓ Wireless debug port: $adb_port"
+              log_ok "Wireless debug port: $adb_port"
             else
-              echo "  ✗ Wireless debug port: not detected (enable in Developer options)"
+              log_warn "Wireless debug port: not detected"
             fi
           else
-            echo "  ✗ Different LAN - wireless connection not available"
+            log_warn "Different LAN - wireless connection not available"
           fi
         else
-          echo "  ✗ Computer IP: not detected"
+          log_warn "Computer IP: not detected"
         fi
       else
-        echo "  ✗ Device WiFi: not connected"
+        log_warn "Device WiFi: not connected"
       fi
     else
-      echo "  ✗ No USB device connected"
+      log_warn "No USB device connected"
     fi
   else
-    echo "  ✗ ADB not available"
+    log_warn "ADB not available"
   fi
 
   echo ""
 
   # --- User input for project config ---
-  echo "[3/4] Confirm or fill in project configuration..."
+  log_info "[3/4] Confirm or fill in project configuration..."
   echo ""
 
   # Package
@@ -377,7 +829,7 @@ cmd_init() {
   else
     read -p "  Package name (e.g. com.example.myapp): " APP_PACKAGE
     if [ -z "$APP_PACKAGE" ]; then
-      echo "ERROR: Package name is required"
+      log_error "Package name is required"
       exit 1
     fi
   fi
@@ -389,7 +841,7 @@ cmd_init() {
   else
     read -p "  Main Activity (e.g. .MainActivity): " APP_ACTIVITY
     if [ -z "$APP_ACTIVITY" ]; then
-      echo "ERROR: Activity is required"
+      log_error "Activity is required"
       exit 1
     fi
   fi
@@ -423,7 +875,7 @@ cmd_init() {
     else
       read -p "  Port (check on device: Developer options > Wireless debugging): " WIRELESS_PORT
       if [ -z "$WIRELESS_PORT" ]; then
-        echo "  WARNING: Port is required for wireless connection"
+        log_warn "Port is required for wireless connection"
         WIRELESS_PORT="5555"
       fi
     fi
@@ -437,7 +889,7 @@ cmd_init() {
 
   # --- Confirm ---
   echo ""
-  echo "[4/4] Configuration summary:"
+  log_info "[4/4] Configuration summary:"
   echo ""
   echo "  Package:    $APP_PACKAGE"
   echo "  Activity:   $APP_ACTIVITY"
@@ -455,149 +907,300 @@ cmd_init() {
   if [[ $REPLY =~ ^[Yy]$ ]]; then
     save_config
     echo ""
-    echo "Done! Try: bash driver.sh smoke"
+    log_info "Try: bash driver.sh smoke"
   else
-    echo "Configuration not saved."
+    log_info "Configuration not saved."
     exit 0
   fi
 }
 
 # ============================================================
-# Commands
+# cmd_build
 # ============================================================
 
 cmd_build() {
   echo "=== Building debug APK ==="
   $GRADLE assembleDebug --console=plain 2>&1 | tail -5
-  echo "APK: $APK_PATH"
+  log_ok "APK: $APK_PATH"
 }
+
+# ============================================================
+# cmd_test
+# ============================================================
 
 cmd_test() {
   echo "=== Running unit tests ==="
   $GRADLE test --console=plain 2>&1 | tail -10
 }
 
+# ============================================================
+# cmd_install
+# ============================================================
+
 cmd_install() {
   echo "=== Installing APK on device ==="
 
   if [ ! -f "$APK_PATH" ]; then
-    echo "APK not found, building first..."
+    log_warn "APK not found, building first..."
     $GRADLE assembleDebug --console=plain 2>&1 | tail -3
   fi
 
-  DEVICE_TYPE=$(get_active_device 2>/dev/null || true)
-  if [ -z "$DEVICE_TYPE" ]; then
-    echo "No device found. Attempting wireless connection..."
-    if ! connect_wireless; then
-      echo "ERROR: No device available for installation"
-      exit 1
-    fi
-  fi
+  ensure_device_connected || exit 1
 
-  echo "Installing to $DEVICE_TYPE device..."
-  $ADB install -r "$APK_PATH" 2>&1
-  echo "✓ APK installed successfully"
+  local device_type
+  device_type=$(get_active_device)
+  log_info "Installing to $device_type device..."
+
+  if $ADB install -r "$APK_PATH" 2>&1; then
+    log_ok "APK installed successfully"
+  else
+    log_error "APK installation failed"
+    return 1
+  fi
 }
+
+# ============================================================
+# cmd_launch
+# ============================================================
 
 cmd_launch() {
   echo "=== Launching app ==="
 
-  DEVICE_TYPE=$(get_active_device 2>/dev/null || true)
-  if [ -z "$DEVICE_TYPE" ]; then
-    echo "No device found. Attempting wireless connection..."
-    if ! connect_wireless; then
-      echo "ERROR: No device available"
-      exit 1
-    fi
-  fi
+  ensure_device_connected || exit 1
 
-  $ADB shell am start -n "$APP_PACKAGE/$APP_ACTIVITY" 2>&1
-  sleep 2
-  echo "✓ App launched"
+  if $ADB shell am start -n "$APP_PACKAGE/$APP_ACTIVITY" 2>&1; then
+    sleep 2
+    log_ok "App launched"
+  else
+    log_error "Failed to launch app"
+    return 1
+  fi
 }
+
+# ============================================================
+# cmd_logcat
+# ============================================================
 
 cmd_logcat() {
   echo "=== Recent logcat ==="
 
-  DEVICE_TYPE=$(get_active_device 2>/dev/null || true)
-  if [ -z "$DEVICE_TYPE" ]; then
-    echo "No device found. Attempting wireless connection..."
-    if ! connect_wireless; then
-      echo "ERROR: No device available"
-      exit 1
-    fi
-  fi
+  ensure_device_connected || exit 1
 
   local filter
   filter=$(echo "$LOGCAT_TAGS" | tr ',' ' ')
 
   $ADB logcat -d -t 100 --pid=$($ADB shell pidof "$APP_PACKAGE" 2>/dev/null || echo 0) 2>/dev/null || \
   $ADB logcat -d -t 100 -s $filter 2>/dev/null || \
-  echo "No running process found. Start the app first."
+  log_warn "No running process found. Start the app first."
 }
+
+# ============================================================
+# cmd_clean
+# ============================================================
 
 cmd_clean() {
   echo "=== Cleaning build ==="
   $GRADLE clean --console=plain 2>&1 | tail -3
+  log_ok "Build cleaned"
 }
 
+# ============================================================
+# cmd_smoke (enhanced)
+# ============================================================
+
 cmd_smoke() {
-  echo "=== Smoke test: build + test + install + launch ==="
-  echo "[1/4] Building..."
-  $GRADLE assembleDebug --console=plain 2>&1 | tail -3
+  local smoke_results=()
+  local smoke_passed=true
 
-  echo "[2/4] Testing..."
-  $GRADLE test --console=plain 2>&1 | tail -5
+  echo "=== Smoke Test ==="
+  echo ""
 
-  echo "[3/4] Checking APK..."
-  if [ -f "$APK_PATH" ]; then
-    SIZE=$(du -h "$APK_PATH" | cut -f1)
-    echo "✓ APK exists: $APK_PATH ($SIZE)"
+  # Step 1: Build
+  log_info "[1/6] Building..."
+  if $GRADLE assembleDebug --console=plain 2>&1 | tail -3; then
+    log_ok "Build succeeded"
+    smoke_results+=("build=true")
   else
-    echo "✗ APK not found!"
-    echo "SMOKE TEST FAILED"
+    log_error "Build failed"
+    smoke_results+=("build=false")
+    smoke_passed=false
+  fi
+
+  # Step 2: Test
+  log_info "[2/6] Testing..."
+  if $GRADLE test --console=plain 2>&1 | tail -5; then
+    log_ok "Tests passed"
+    smoke_results+=("test=true")
+  else
+    log_warn "Tests failed (non-blocking)"
+    smoke_results+=("test=false")
+  fi
+
+  # Step 3: Check APK
+  log_info "[3/6] Checking APK..."
+  if [ -f "$APK_PATH" ]; then
+    local size
+    size=$(du -h "$APK_PATH" | cut -f1)
+    log_ok "APK exists: $APK_PATH ($size)"
+    smoke_results+=("apk=true")
+  else
+    log_error "APK not found!"
+    smoke_results+=("apk=false")
+    smoke_passed=false
+  fi
+
+  # Step 4: Device connection
+  log_info "[4/6] Checking device..."
+  if ensure_device_connected 2>/dev/null; then
+    local device_type
+    device_type=$(get_active_device)
+    log_ok "Device connected ($device_type)"
+    smoke_results+=("device=true")
+  else
+    log_error "No device connected"
+    smoke_results+=("device=false")
+    smoke_passed=false
+  fi
+
+  # Step 5: Install and Launch
+  if [ "${smoke_results[-1]}" = "device=true" ] && [ "$smoke_passed" = true ]; then
+    log_info "[5/6] Installing and launching..."
+
+    if $ADB install -r "$APK_PATH" 2>&1; then
+      log_ok "Installed"
+      smoke_results+=("install=true")
+
+      # Launch
+      $ADB shell am start -n "$APP_PACKAGE/$APP_ACTIVITY" 2>&1
+      log_ok "Launched"
+      smoke_results+=("launch=true")
+
+      # Wait for activity
+      log_info "Waiting for app to stabilize..."
+      sleep 10
+
+      # Check current activity
+      local current_activity
+      current_activity=$(get_current_activity 2>/dev/null || true)
+      if [ -n "$current_activity" ]; then
+        log_ok "Activity detected: $current_activity"
+        smoke_results+=("activity=true")
+      else
+        log_warn "Could not detect current activity"
+        smoke_results+=("activity=false")
+      fi
+
+      # Check for crashes
+      log_info "[6/6] Checking for crashes..."
+      if check_runtime_crash "$APP_PACKAGE"; then
+        log_error "App crashed after launch!"
+        smoke_results+=("crash=false")
+        smoke_passed=false
+
+        # Show crash details
+        local crash_data
+        crash_data=$(find_latest_crash 2>/dev/null || true)
+        if [ -n "$crash_data" ]; then
+          echo ""
+          echo "[Crash Details]"
+          local crash_info
+          crash_info=$(analyze_crash "$crash_data")
+          local exception
+          exception=$(echo "$crash_info" | grep '^exception=' | cut -d= -f2-)
+          local location
+          location=$(echo "$crash_info" | grep '^location=' | cut -d= -f2-)
+          echo "Exception: ${exception:-unknown}"
+          echo "Location: ${location:-unknown}"
+        fi
+      else
+        log_ok "No crash detected"
+        smoke_results+=("crash=true")
+      fi
+
+      # Auto screenshot
+      log_info "Taking smoke test screenshot..."
+      local screenshot_path
+      screenshot_path=$(cmd_screenshot "smoke_$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true)
+      if [ -n "$screenshot_path" ]; then
+        smoke_results+=("screenshot=$screenshot_path")
+      fi
+    else
+      log_error "Installation failed"
+      smoke_results+=("install=false")
+      smoke_results+=("launch=false")
+      smoke_passed=false
+    fi
+  else
+    smoke_results+=("install=false")
+    smoke_results+=("launch=false")
+  fi
+
+  # --- Summary ---
+  echo ""
+  echo "=== Smoke Test Summary ==="
+  echo ""
+
+  for item in "${smoke_results[@]}"; do
+    local key="${item%%=*}"
+    local value="${item#*=}"
+
+    case "$key" in
+      build)     [ "$value" = "true" ] && log_ok "Build" || log_error "Build" ;;
+      test)      [ "$value" = "true" ] && log_ok "Tests" || log_warn "Tests" ;;
+      apk)       [ "$value" = "true" ] && log_ok "APK" || log_error "APK" ;;
+      device)    [ "$value" = "true" ] && log_ok "Device" || log_error "Device" ;;
+      install)   [ "$value" = "true" ] && log_ok "Install" || log_error "Install" ;;
+      launch)    [ "$value" = "true" ] && log_ok "Launch" || log_error "Launch" ;;
+      activity)  [ "$value" = "true" ] && log_ok "Activity" || log_warn "Activity" ;;
+      crash)     [ "$value" = "true" ] && log_ok "No Crash" || log_error "Crash Detected" ;;
+      screenshot) log_info "Screenshot: $value" ;;
+    esac
+  done
+
+  echo ""
+  if $smoke_passed; then
+    log_ok "SMOKE TEST PASSED"
+  else
+    log_error "SMOKE TEST FAILED"
     exit 1
   fi
 
-  echo "[4/4] Device connection..."
-  DEVICE_TYPE=$(get_active_device 2>/dev/null || true)
-  if [ -n "$DEVICE_TYPE" ]; then
-    echo "✓ Device connected ($DEVICE_TYPE)"
+  # JSON output
+  if $JSON_MODE; then
     echo ""
-    read -p "Install and launch app? (y/n): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-      echo "Installing..."
-      $ADB install -r "$APK_PATH" 2>&1
-      echo "Launching..."
-      $ADB shell am start -n "$APP_PACKAGE/$APP_ACTIVITY" 2>&1
-      sleep 2
-      echo "✓ App installed and launched"
-      echo ""
-      echo "View logs: bash driver.sh logcat"
-    fi
-  else
-    echo "✗ No device connected"
-    echo ""
-    echo "To connect:"
-    echo "  Wired: Connect device via USB"
-    echo "  Wireless: bash driver.sh connect"
+    local json="{"
+    local first=true
+    for item in "${smoke_results[@]}"; do
+      local key="${item%%=*}"
+      local value="${item#*=}"
+      if $first; then first=false; else json+=","; fi
+      if [ "$value" = "true" ]; then
+        json+="\"$key\":true"
+      elif [ "$value" = "false" ]; then
+        json+="\"$key\":false"
+      else
+        json+="\"$key\":\"$(json_escape "$value")\""
+      fi
+    done
+    json+=",\"passed\":$smoke_passed"
+    json+="}"
+    echo "$json"
   fi
-
-  echo ""
-  echo "SMOKE TEST PASSED"
 }
+
+# ============================================================
+# cmd_connect
+# ============================================================
 
 cmd_connect() {
   echo "=== Device Connection Status ==="
 
   # Check wired
   if check_wired_device; then
-    echo "✓ Wired device connected"
+    log_ok "Wired device connected"
 
-    # Auto-detect WiFi info for wireless setup
     echo ""
-    echo "Device network info:"
+    log_info "Device network info:"
     local wifi_ip
     wifi_ip=$(get_device_wifi_ip 2>/dev/null || true)
     local wifi_mac
@@ -607,7 +1210,6 @@ cmd_connect() {
       echo "  WiFi IP:  $wifi_ip"
       echo "  WiFi MAC: ${wifi_mac:-unknown}"
 
-      # Check same LAN
       local comp_ip
       comp_ip=$(get_computer_ip "$wifi_ip" 2>/dev/null || true)
       if [ -n "$comp_ip" ]; then
@@ -615,7 +1217,7 @@ cmd_connect() {
         if check_same_lan "$wifi_ip" "$comp_ip"; then
           echo "  LAN:      ✓ Same network"
           echo ""
-          echo "  Wireless connection available: adb connect $wifi_ip:<port>"
+          log_info "Wireless connection available: adb connect $wifi_ip:<port>"
         else
           echo "  LAN:      ✗ Different network"
         fi
@@ -624,16 +1226,16 @@ cmd_connect() {
       echo "  WiFi:     Not connected"
     fi
   else
-    echo "✗ No wired device"
+    log_warn "No wired device"
   fi
 
   echo ""
 
   # Check wireless
   if check_wireless_device; then
-    echo "✓ Wireless device connected ($WIRELESS_IP:$WIRELESS_PORT)"
+    log_ok "Wireless device connected ($WIRELESS_IP:$WIRELESS_PORT)"
   elif [ -n "${WIRELESS_IP:-}" ]; then
-    echo "✗ No wireless device"
+    log_warn "No wireless device"
     echo ""
     read -p "Try wireless connection? (y/n): " -n 1 -r
     echo
@@ -641,53 +1243,129 @@ cmd_connect() {
       connect_wireless
     fi
   else
-    echo "✗ Wireless not configured (run: bash driver.sh init)"
+    log_warn "Wireless not configured (run: bash driver.sh init)"
   fi
 }
+
+# ============================================================
+# cmd_devices
+# ============================================================
 
 cmd_devices() {
   echo "=== Connected devices ==="
-  $ADB devices -l 2>&1
-  echo ""
 
-  # Show network info if wired device connected
-  if check_wired_device; then
-    echo "=== Device Network ==="
-    local wifi_ip
-    wifi_ip=$(get_device_wifi_ip 2>/dev/null || true)
-    local wifi_mac
-    wifi_mac=$(get_device_wifi_mac 2>/dev/null || true)
-    echo "WiFi IP:  ${wifi_ip:-not connected}"
-    echo "WiFi MAC: ${wifi_mac:-unknown}"
+  if $JSON_MODE; then
+    print_json_devices
+  else
+    $ADB devices -l 2>&1
+    echo ""
+
+    if check_wired_device; then
+      log_info "Device Network:"
+      local wifi_ip
+      wifi_ip=$(get_device_wifi_ip 2>/dev/null || true)
+      local wifi_mac
+      wifi_mac=$(get_device_wifi_mac 2>/dev/null || true)
+      echo "  WiFi IP:  ${wifi_ip:-not connected}"
+      echo "  WiFi MAC: ${wifi_mac:-unknown}"
+    fi
+
+    echo ""
+    echo "ADB path: $ADB"
   fi
+}
+
+print_json_devices() {
+  local devices_output
+  devices_output=$($ADB devices 2>/dev/null | grep -v "List" | grep -v "^$" || true)
+
+  echo "{"
+  echo "  \"devices\": ["
+
+  local first=true
+  while IFS= read -r line; do
+    if [ -z "$line" ]; then
+      continue
+    fi
+
+    local serial
+    serial=$(echo "$line" | awk '{print $1}')
+    local state
+    state=$(echo "$line" | awk '{print $2}')
+
+    # Get IP if available
+    local ip=""
+    local wifi=false
+    if [[ "$serial" == *":"* ]]; then
+      ip="${serial%%:*}"
+      wifi=true
+    elif [ "$state" = "device" ]; then
+      ip=$(get_device_wifi_ip 2>/dev/null || true)
+      if [ -n "$ip" ]; then
+        wifi=true
+      fi
+    fi
+
+    if $first; then
+      first=false
+    else
+      echo ","
+    fi
+
+    echo -n "    {"
+    echo -n "\"serial\":\"$(json_escape "$serial")\","
+    echo -n "\"state\":\"$(json_escape "$state")\","
+    echo -n "\"ip\":\"$(json_escape "${ip:-}")\","
+    echo -n "\"wifi\":$wifi"
+    echo -n "}"
+  done <<< "$devices_output"
 
   echo ""
-  echo "ADB path: $ADB"
+  echo "  ]"
+  echo "}"
 }
+
+# ============================================================
+# cmd_help
+# ============================================================
 
 cmd_help() {
   echo "Android App Builder Driver"
   echo ""
-  echo "Usage: driver.sh <command>"
+  echo "Usage: driver.sh <command> [options]"
   echo ""
   echo "Commands:"
-  echo "  init       Initialize project configuration (auto-detect + user input)"
-  echo "  build      Build debug APK"
-  echo "  test       Run unit tests"
-  echo "  install    Build and install APK (auto-connect device)"
-  echo "  launch     Launch app on device"
-  echo "  logcat     View app logs"
-  echo "  clean      Clean build"
-  echo "  smoke      Full smoke test (build + test + install)"
-  echo "  connect    Check/connect wireless device"
-  echo "  devices    List connected devices"
+  echo "  init        Initialize project configuration (auto-detect + user input)"
+  echo "  build       Build debug APK"
+  echo "  test        Run unit tests"
+  echo "  install     Build and install APK (auto-connect device)"
+  echo "  launch      Launch app on device"
+  echo "  logcat      View app logs"
+  echo "  clean       Clean build"
+  echo "  smoke       Full smoke test (build + test + install + launch + crash check)"
+  echo "  connect     Check/connect wireless device"
+  echo "  devices     List connected devices"
+  echo "  doctor      Environment diagnosis + crash analysis"
+  echo "  screenshot  Take device screenshot"
+  echo "  ui-dump     Dump UI hierarchy (XML)"
+  echo "  inspect     Take screenshot + UI dump (for AI analysis)"
+  echo ""
+  echo "Options:"
+  echo "  --json      Output in JSON format (for: devices, doctor, smoke)"
+  echo ""
+  echo "Examples:"
+  echo "  bash driver.sh init"
+  echo "  bash driver.sh smoke"
+  echo "  bash driver.sh doctor --json"
+  echo "  bash driver.sh screenshot my_capture"
+  echo "  bash driver.sh inspect"
 }
 
 # ============================================================
-# Main
+# Main dispatcher
 # ============================================================
 
-# Handle init and help without requiring config
+# Commands that don't need config or ADB
 case "$CMD" in
   init)
     cmd_init
@@ -699,42 +1377,51 @@ case "$CMD" in
     ;;
 esac
 
-# Load config for all other commands
+# Load config for remaining commands
 load_config
 
-# Detect Gradle
-GRADLE=$(detect_gradle 2>/dev/null || true)
-if [ -z "$GRADLE" ]; then
-  echo "ERROR: No gradle wrapper found"
-  exit 1
-fi
-
-# Detect ADB (for commands that need it)
+# Detect Gradle (needed for build-related commands)
 case "$CMD" in
-  build|test|clean)
-    ;;
-  *)
-    ADB=$(detect_adb 2>/dev/null || true)
-    if [ -z "$ADB" ]; then
-      echo "ERROR: ADB not found. Please install Android SDK Platform Tools."
+  build|test|install|clean|smoke)
+    GRADLE=$(detect_gradle 2>/dev/null || true)
+    if [ -z "$GRADLE" ]; then
+      log_error "No gradle wrapper found"
       exit 1
     fi
     ;;
 esac
 
-# Run command
+# Detect ADB (needed for device commands)
 case "$CMD" in
-  build)    cmd_build ;;
-  test)     cmd_test ;;
-  install)  cmd_install ;;
-  launch)   cmd_launch ;;
-  logcat)   cmd_logcat ;;
-  clean)    cmd_clean ;;
-  smoke)    cmd_smoke ;;
-  connect)  cmd_connect ;;
-  devices)  cmd_devices ;;
+  build|test|clean)
+    # These don't need ADB
+    ;;
   *)
-    echo "Unknown command: $CMD"
+    ADB=$(detect_adb 2>/dev/null || true)
+    if [ -z "$ADB" ]; then
+      log_error "ADB not found. Please install Android SDK Platform Tools."
+      exit 1
+    fi
+    ;;
+esac
+
+# Dispatch command
+case "$CMD" in
+  build)      cmd_build ;;
+  test)       cmd_test ;;
+  install)    cmd_install ;;
+  launch)     cmd_launch ;;
+  logcat)     cmd_logcat ;;
+  clean)      cmd_clean ;;
+  smoke)      cmd_smoke ;;
+  connect)    cmd_connect ;;
+  devices)    cmd_devices ;;
+  doctor)     cmd_doctor ;;
+  screenshot) cmd_screenshot "${ARGS[0]:-}" ;;
+  ui-dump)    cmd_ui_dump ;;
+  inspect)    cmd_inspect ;;
+  *)
+    log_error "Unknown command: $CMD"
     echo ""
     cmd_help
     exit 1

@@ -17,50 +17,147 @@ description: Build, test, install, and run Android apps with auto device detecti
 
 ## 快速开始
 
-### 1. 初始化配置（首次使用）
-
 在你的 Android 项目目录下运行：
 
 ```bash
 bash /path/to/android-builder/driver.sh init
 ```
 
-自动检测项目信息，检测不到的会询问用户：
-
-| 配置项 | 自动检测来源 | 示例 |
-|--------|-------------|------|
-| 包名 | `app/build.gradle` 的 `applicationId` / `namespace` | `com.example.myapp` |
-| 主 Activity | `AndroidManifest.xml` 的 MAIN+LAUNCHER intent-filter | `.MainActivity` |
-| Gradle | 项目根目录的 `gradlew` / `gradlew.bat` | `./gradlew` |
-| ADB | 系统 PATH 或 Android SDK 目录 | 自动检测 |
-| 无线设备 | 用户手动输入 | `192.168.1.100:5555` |
-
-### 2. 运行 Smoke Test
-
-```bash
-bash /path/to/android-builder/driver.sh smoke
-```
-
-完整流程：build → test → APK 检查 → 设备连接 → install & launch（如有设备）。
-
 ## 命令列表
 
 ```bash
-bash /path/to/android-builder/driver.sh <command>
+bash /path/to/android-builder/driver.sh <command> [options]
 ```
+
+### 基础命令
 
 | 命令 | 功能 |
 |------|------|
 | `init` | 初始化项目配置（自动检测 + 用户输入） |
-| `build` | `gradlew assembleDebug` — 构建 debug APK |
-| `test` | `gradlew test` — 运行单元测试 |
+| `build` | 构建 debug APK |
+| `test` | 运行单元测试 |
 | `install` | 自动构建、检测设备、安装 APK |
 | `launch` | 在设备上启动 app |
 | `logcat` | 查看 app 日志 |
-| `clean` | `gradlew clean` |
-| `smoke` | 完整烟雾测试：build + test + install + launch |
+| `clean` | 清理构建 |
+| `smoke` | 完整烟雾测试（含崩溃检测 + 自动截图） |
 | `connect` | 检查设备连接，尝试无线连接 |
 | `devices` | 列出所有已连接的 ADB 设备 |
+
+### 诊断命令
+
+| 命令 | 功能 |
+|------|------|
+| `doctor` | 环境诊断 + 崩溃分析 |
+| `screenshot` | 设备截图 |
+| `ui-dump` | 导出 UI 层级结构 (XML) |
+| `inspect` | 截图 + UI 一键导出（供 AI 分析） |
+
+### 全局选项
+
+| 选项 | 说明 |
+|------|------|
+| `--json` | JSON 格式输出（支持: devices, doctor, smoke） |
+
+## 智能无线配置
+
+`init` 命令自动检测已连接的 USB 设备：
+
+1. 获取设备 WiFi IP 和 MAC 地址
+2. 检测设备和电脑是否在同一局域网
+3. 尝试获取无线调试端口
+4. 自动填充配置
+
+## doctor 命令
+
+环境诊断 + 崩溃分析：
+
+```bash
+bash driver.sh doctor
+```
+
+检测项：
+- Java / javac / ADB / Gradle
+- ANDROID_HOME / ANDROID_SDK_ROOT
+- 设备连接状态
+- WiFi IP / MAC
+- 无线调试端口
+- 最近崩溃分析
+
+输出示例：
+```
+[OK] Java detected: 21
+[OK] ADB detected: adb
+[OK] Device connected
+[OK] Device WiFi IP: 192.168.1.100
+[ERROR] No recent crashes found
+```
+
+JSON 输出：
+```bash
+bash driver.sh doctor --json
+```
+
+## screenshot 命令
+
+自动截图并保存到本地：
+
+```bash
+bash driver.sh screenshot              # 自动生成文件名
+bash driver.sh screenshot my_capture   # 自定义文件名
+```
+
+保存位置：`./screenshots/`
+
+## ui-dump 命令
+
+导出当前页面的 UI 层级结构：
+
+```bash
+bash driver.sh ui-dump
+```
+
+保存位置：`./ui-dumps/`
+
+## inspect 命令
+
+一键导出当前页面状态（截图 + UI 结构），方便 AI 分析：
+
+```bash
+bash driver.sh inspect
+```
+
+## smoke 命令（增强版）
+
+完整烟雾测试流程：
+
+1. Build → 编译 APK
+2. Test → 运行单元测试
+3. Check APK → 验证产物
+4. Install → 安装到设备
+5. Launch → 启动 app
+6. Wait → 等待稳定
+7. Activity Check → 检测当前页面
+8. Crash Check → 检测运行时崩溃
+9. Screenshot → 自动截图
+
+输出示例：
+```
+[OK] Build
+[OK] Tests
+[OK] APK
+[OK] Device
+[OK] Install
+[OK] Launch
+[OK] Activity
+[OK] No Crash
+[OK] SMOKE TEST PASSED
+```
+
+JSON 输出：
+```bash
+bash driver.sh smoke --json
+```
 
 ## 设备连接
 
@@ -69,57 +166,17 @@ bash /path/to/android-builder/driver.sh <command>
 1. **USB 有线** — 优先检测
 2. **WiFi 无线** — 有线未找到时自动尝试
 
-### 智能无线配置
-
-`init` 命令会自动检测已连接的 USB 设备：
-
-1. 获取设备 WiFi IP 和 MAC 地址
-2. 检测设备和电脑是否在同一局域网
-3. 尝试获取无线调试端口
-4. 自动填充配置，减少手动输入
-
-如果端口获取失败，会提示用户在设备上查看：**开发者选项 → 无线调试**
-
-### 手动配置
-
-也可以手动编辑 `app-config.env`：
-
-```bash
-WIRELESS_IP=192.168.1.100
-WIRELESS_PORT=5555
-```
-
-### 首次无线配对
-
-如果无线连接失败，需要先配对：
-
-1. 在设备上启用**无线调试**（开发者选项）
-2. 获取配对码：设备 > 无线调试 > 使用配对码配对设备
-3. 运行：`adb pair <ip>:<pairing_port>`
-4. 输入配对码
-
 ## 配置文件
 
 配置保存在 `app-config.env`（与 driver.sh 同目录）：
 
 ```bash
-# Android App Configuration
 APP_PACKAGE=com.example.myapp
 APP_ACTIVITY=.MainActivity
 APK_PATH=app/build/outputs/apk/debug/app-debug.apk
 WIRELESS_IP=192.168.1.100
 WIRELESS_PORT=5555
 LOGCAT_TAGS=MainActivity
-```
-
-可以手动编辑，或重新运行 `init` 更新。
-
-## 直接使用 Gradle（跳过驱动）
-
-```bash
-./gradlew assembleDebug    # 构建
-./gradlew test             # 测试
-./gradlew clean            # 清理
 ```
 
 ## ADB 检测路径
@@ -130,15 +187,12 @@ LOGCAT_TAGS=MainActivity
 2. `%LOCALAPPDATA%/Android/Sdk/platform-tools/`
 3. `$HOME/AppData/Local/Android/Sdk/platform-tools/`
 
-未找到时会提示下载链接。
-
 ## 常见问题
 
 | 症状 | 解决方案 |
 |------|----------|
-| `Configuration not found` | 运行 `bash driver.sh init` 初始化配置 |
-| `JAVA_HOME not set` | 设置 `JAVA_HOME` 环境变量指向 JDK 安装目录 |
-| `SDK location not found` | 创建 `local.properties` 写入 `sdk.dir=<Android SDK 路径>` |
-| `Could not find build tools` | `sdkmanager "build-tools;<version>"` |
-| ADB not found | 下载 [platform-tools](https://googledownloads.cn/android/repository/platform-tools-latest-windows.zip)，解压后将目录添加到 PATH |
+| `Configuration not found` | 运行 `bash driver.sh init` |
+| `JAVA_HOME not set` | 设置 `JAVA_HOME` 环境变量 |
+| `SDK location not found` | 创建 `local.properties` 写入 `sdk.dir=<路径>` |
+| ADB not found | 下载 [platform-tools](https://googledownloads.cn/android/repository/platform-tools-latest-windows.zip) |
 | 无线连接失败 | 先配对：`adb pair <ip>:<port>` |
